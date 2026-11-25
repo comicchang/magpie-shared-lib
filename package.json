@@ -1,0 +1,54 @@
+{
+  "name": "magpie-shared-lib",
+  "version": "0.2.0",
+  "description": "Zero-dependency shared ESM library for Magpie extensions: runtime path & secret resolution, EADDRINUSE retry listener, balance probers, read-only billing protection models, and fast backward-tail usage.jsonl aggregation.",
+  "type": "module",
+  "main": "./index.mjs",
+  "types": "./types.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types.d.ts",
+      "default": "./index.mjs"
+    },
+    "./runtime": {
+      "types": "./types.d.ts",
+      "default": "./runtime.mjs"
+    },
+    "./billing-protection": {
+      "types": "./types.d.ts",
+      "default": "./billing-protection.mjs"
+    },
+    "./station-probe": {
+      "types": "./types.d.ts",
+      "default": "./station-probe.mjs"
+    },
+    "./usage-jsonl": {
+      "default": "./usage-jsonl.mjs"
+    }
+  },
+  "files": [
+    "index.mjs",
+    "runtime.mjs",
+    "billing-protection.mjs",
+    "station-probe.mjs",
+    "usage-jsonl.mjs",
+    "types.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "test": "bun test runtime.test.mjs usage-jsonl.test.mjs"
+  },
+  "keywords": [
+    "magpie",
+    "shared-lib",
+    "runtime",
+    "usage-jsonl",
+    "billing-protection",
+    "esm"
+  ],
+  "license": "MIT"
+}
