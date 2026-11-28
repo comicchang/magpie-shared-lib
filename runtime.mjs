@@ -1,39 +1,40 @@
 /**
- * magpie-shared-lib/runtime.mjs — Vendor-agnostic Magpie shared runtime primitives（零供应商耦合，可独立开源发布）。
+ * _shared/runtime.mjs — Magpie 插件通用运行时原语（零供应商耦合，可独立开源发布）。
  *
  * 统一封装跨插件共用的环境解析、Python CLI 桥接、凭据文件读取与端口重试监听，
  * 消除各插件之间的相对路径互引与对特定仓库目录结构的硬编码依赖。
  *
  * 环境变量优先级（通用名优先，兼容旧变量）：
- *   - 解释器：`MAGPIE_PYTHON` > `command -v python3`
- *   - 状态目录：`MAGPIE_STATE_DIR` > `~/.local/share/magpie`
- *   - 缓存目录：`MAGPIE_CACHE_DIR` > `~/.cache/magpie`
+ *   - 解释器：`MAGPIE_PYTHON` > `DOTAI_PYTHON` > `command -v python3`
+ *   - 状态目录：`MAGPIE_STATE_DIR` > `~/.local/share/dotai`
+ *   - 缓存目录：`MAGPIE_CACHE_DIR` > `~/.cache/dotai`
  *   - 凭据文件：`options.envFile` > `MAGPIE_ENV_FILE` > `<repoRoot>/profiles/common/common.sh`
- *   - 工作区根：`options.repoRoot` > `MAGPIE_WORKSPACE` > 向上探测 marker
+ *   - 工作区根：`options.repoRoot` > `MAGPIE_WORKSPACE` > `DOTAI_REPO` > 向上探测 marker
  */
 
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 export const DEFAULT_FILL_SENTINEL = "__FILL_ME__";
 
-/** 默认状态根目录：`MAGPIE_STATE_DIR` > `~/.local/share/magpie`。 */
+/** 默认状态根目录：`MAGPIE_STATE_DIR` > `~/.local/share/dotai`。 */
 export function defaultStateBaseDir(env = process.env) {
   const v = typeof env?.MAGPIE_STATE_DIR === "string" ? env.MAGPIE_STATE_DIR.trim() : "";
-  return v || join(homedir(), ".local", "share", "magpie");
+  return v || join(homedir(), ".local", "share", "dotai");
 }
 
-/** 默认缓存根目录：`MAGPIE_CACHE_DIR` > `~/.cache/magpie`。 */
+/** 默认缓存根目录：`MAGPIE_CACHE_DIR` > `~/.cache/dotai`。 */
 export function defaultCacheBaseDir(env = process.env) {
   const v = typeof env?.MAGPIE_CACHE_DIR === "string" ? env.MAGPIE_CACHE_DIR.trim() : "";
-  return v || join(homedir(), ".cache", "magpie");
+  return v || join(homedir(), ".cache", "dotai");
 }
 
 /** 解析工作区根目录：显式 override > envVars > 从 startDir 向上探测 markerRel。 */
 export function findWorkspaceRoot(
   markerRel,
-  { override = "", envVars = ["MAGPIE_WORKSPACE"], startDir = process.cwd(), maxDepth = 8, env = process.env } = {}
+  { override = "", envVars = ["MAGPIE_WORKSPACE", "DOTAI_REPO"], startDir = process.cwd(), maxDepth = 8, env = process.env } = {}
 ) {
   const check = (dir) => Boolean(dir && existsSync(join(dir, markerRel)));
   if (typeof override === "string" && override.trim() && check(override.trim())) return override.trim();
@@ -92,12 +93,12 @@ function shDoubleQuote(s) {
 
 /**
  * 通用 Python 解释器解析前缀（POSIX sh，绝不烘焙版本号或绝对路径）：
- *   `MAGPIE_PYTHON` > `command -v python3`；缺失显式 exit 127。
+ *   `MAGPIE_PYTHON` > `DOTAI_PYTHON` > `command -v python3`；缺失显式 exit 127。
  */
 export const PYTHON_SHELL_PREFIX = [
   '[ -d /opt/homebrew/bin ] && export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"',
-  'py="${MAGPIE_PYTHON:-}"; [ -n "$py" ] || py="$(command -v python3)"',
-  'if [ -z "$py" ]; then echo "magpie-shared-lib: python3 unavailable (set MAGPIE_PYTHON or ensure python3 is on PATH)" >&2; exit 127; fi',
+  'py="${MAGPIE_PYTHON:-${DOTAI_PYTHON:-}}"; [ -n "$py" ] || py="$(command -v python3)"',
+  'if [ -z "$py" ]; then echo "magpie-plugin: python3 不可用（请设 MAGPIE_PYTHON 或 DOTAI_PYTHON 或确保 PATH 有 python3）" >&2; exit 127; fi',
 ].join("; ");
 
 /** 构造 Python CLI 执行命令：解析解释器 → 可选 source envFile → exec CLI。 */
@@ -125,18 +126,24 @@ export function listenFailure(port, err) {
   return failure;
 }
 
-export function listenWithRetry(server, { port, host = "127.0.0.1", retryMs, windowMs } = {}) {
+export function listenWithRetry(server, { port, host = "127.0.0.1", retryMs, windowMs, signal } = {}) {
   const step = Number.isFinite(Number(retryMs)) && Number(retryMs) >= 0 ? Number(retryMs) : DEFAULT_LISTEN_RETRY_MS;
   const window =
     Number.isFinite(Number(windowMs)) && Number(windowMs) >= 0 ? Number(windowMs) : DEFAULT_LISTEN_RETRY_WINDOW_MS;
   return new Promise((resolvePromise, reject) => {
+    if (signal?.aborted) {
+      reject(listenFailure(port, new Error("aborted")));
+      return;
+    }
     const startedAt = Date.now();
     let timer = null;
+    const onAbort = () => settle(reject, listenFailure(port, new Error("aborted")));
     const settle = (fn, arg) => {
       if (timer) {
         clearTimeout(timer);
         timer = null;
       }
+      signal?.removeEventListener("abort", onAbort);
       server.off?.("error", onError);
       server.off?.("listening", onListening);
       fn(arg);
@@ -153,9 +160,96 @@ export function listenWithRetry(server, { port, host = "127.0.0.1", retryMs, win
     };
     const attempt = () => {
       timer = null;
+      if (signal?.aborted) {
+        settle(reject, listenFailure(port, new Error("aborted")));
+        return;
+      }
       server.listen(port, host, onListening);
     };
+    signal?.addEventListener("abort", onAbort, { once: true });
     server.on("error", onError);
     attempt();
   });
+}
+
+// ---- 共享 Magpie 宿主生命周期与本地环回安全原语 ----
+
+export function isLoopbackHost(hostHeader) {
+  if (typeof hostHeader !== "string" || !hostHeader.trim()) return false;
+  const host = hostHeader.trim().toLowerCase();
+  return /^127\.0\.0\.1(?::\d+)?$/.test(host) || /^localhost(?::\d+)?$/.test(host) || /^\[::1\](?::\d+)?$/.test(host);
+}
+
+export function isLoopbackOrigin(originHeader) {
+  if (!originHeader) return true;
+  if (String(originHeader).trim().toLowerCase() === "null") return true;
+  try {
+    const h = new URL(originHeader).hostname.toLowerCase();
+    return h === "127.0.0.1" || h === "localhost" || h === "::1" || h === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
+export function createCsrfToken(bytes = 24) {
+  return randomBytes(bytes).toString("hex");
+}
+
+export function verifyCsrfToken(provided, expected) {
+  if (typeof provided !== "string" || typeof expected !== "string" || !provided || !expected) {
+    return false;
+  }
+  const a = Buffer.from(provided, "utf8");
+  const b = Buffer.from(expected, "utf8");
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+export function injectCsrfMeta(html, token, metaName = "magpie-csrf") {
+  const safeToken = String(token || "").replace(/[^A-Za-z0-9._-]/g, "");
+  const tag = `<meta name="${metaName}" content="${safeToken}">`;
+  const source = String(html || "");
+  if (source.includes("</head>")) {
+    return source.replace("</head>", `  ${tag}\n</head>`);
+  }
+  return `${tag}\n${source}`;
+}
+
+/**
+ * 绑定共享 Magpie 插件宿主（host.js）优雅停机钩子：
+ *   - 监听 `process.stdin` 的 `end`/`close`（Magpie 调用 `h.in.Close()` 的第一信号，毫秒级释放端口/子进程）；
+ *   - 监听 `beforeExit` / `exit` 兜底；
+ *   - 绝不注册 `SIGTERM`/`SIGINT` 监听器，以免吞掉发给共享 `host.js` 的终止信号。
+ */
+export function bindHostShutdown(onStop, { watchHostStdin = true } = {}) {
+  let called = false;
+  const runOnce = () => {
+    if (called) return;
+    called = true;
+    try {
+      onStop();
+    } catch {
+      /* ignore shutdown errors */
+    }
+  };
+  process.once("exit", runOnce);
+  process.once("beforeExit", runOnce);
+  const attachStdin =
+    watchHostStdin &&
+    process.stdin &&
+    !process.stdin.isTTY &&
+    !process.stdin.destroyed &&
+    process.stdin.readable;
+  if (attachStdin) {
+    process.stdin.once("end", runOnce);
+    process.stdin.once("close", runOnce);
+  }
+  return () => {
+    process.removeListener("exit", runOnce);
+    process.removeListener("beforeExit", runOnce);
+    if (attachStdin) {
+      process.stdin.removeListener("end", runOnce);
+      process.stdin.removeListener("close", runOnce);
+    }
+  };
 }

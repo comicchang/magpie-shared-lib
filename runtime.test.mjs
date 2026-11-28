@@ -13,7 +13,7 @@ import {
 } from "./runtime.mjs";
 import { billingStateDir, billingProtectionSwitchPaths } from "./billing-protection.mjs";
 
-describe("magpie-shared-lib/runtime — 通用运行时原语（零供应商/零仓库名硬编码）", () => {
+describe("_shared/runtime — 通用运行时原语（零供应商/零仓库名硬编码）", () => {
   let tmp;
 
   beforeEach(() => {
@@ -24,14 +24,14 @@ describe("magpie-shared-lib/runtime — 通用运行时原语（零供应商/零
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("defaultStateBaseDir / defaultCacheBaseDir: MAGPIE_* 优先于 ~/.local/share/magpie & ~/.cache/magpie", () => {
+  it("defaultStateBaseDir / defaultCacheBaseDir: MAGPIE_* 优先于 ~/.local/share/dotai & ~/.cache/dotai", () => {
     expect(defaultStateBaseDir({ MAGPIE_STATE_DIR: "/custom/state" })).toBe("/custom/state");
     expect(defaultCacheBaseDir({ MAGPIE_CACHE_DIR: "/custom/cache" })).toBe("/custom/cache");
-    expect(defaultStateBaseDir({ MAGPIE_STATE_DIR: "   " })).toBe(join(homedir(), ".local", "share", "magpie"));
-    expect(defaultCacheBaseDir({})).toBe(join(homedir(), ".cache", "magpie"));
+    expect(defaultStateBaseDir({ MAGPIE_STATE_DIR: "   " })).toBe(join(homedir(), ".local", "share", "dotai"));
+    expect(defaultCacheBaseDir({})).toBe(join(homedir(), ".cache", "dotai"));
   });
 
-  it("findWorkspaceRoot: override > MAGPIE_WORKSPACE > custom envVars > 上溯目录", () => {
+  it("findWorkspaceRoot: override > MAGPIE_WORKSPACE > DOTAI_REPO > 上溯目录", () => {
     const wsA = join(tmp, "ws-a");
     const wsB = join(tmp, "ws-b");
     const nested = join(wsB, "a", "b");
@@ -42,8 +42,8 @@ describe("magpie-shared-lib/runtime — 通用运行时原语（零供应商/零
     writeFileSync(join(wsB, "scripts", "marker.py"), "");
 
     expect(findWorkspaceRoot("scripts/marker.py", { override: wsA, env: { MAGPIE_WORKSPACE: wsB } })).toBe(wsA);
-    expect(findWorkspaceRoot("scripts/marker.py", { env: { MAGPIE_WORKSPACE: wsA, CUSTOM_WS: wsB }, envVars: ["MAGPIE_WORKSPACE", "CUSTOM_WS"] })).toBe(wsA);
-    expect(findWorkspaceRoot("scripts/marker.py", { env: { CUSTOM_WS: wsB }, envVars: ["MAGPIE_WORKSPACE", "CUSTOM_WS"] })).toBe(wsB);
+    expect(findWorkspaceRoot("scripts/marker.py", { env: { MAGPIE_WORKSPACE: wsA, DOTAI_REPO: wsB } })).toBe(wsA);
+    expect(findWorkspaceRoot("scripts/marker.py", { env: { DOTAI_REPO: wsB } })).toBe(wsB);
     expect(findWorkspaceRoot("scripts/marker.py", { env: {}, startDir: nested })).toBe(wsB);
     expect(findWorkspaceRoot("scripts/missing.py", { env: {}, startDir: tmp })).toBe("");
   });
@@ -70,7 +70,7 @@ describe("magpie-shared-lib/runtime — 通用运行时原语（零供应商/零
     expect(readSecretFromEnv("MISSING_TOKEN", { envFile: envPath, env: {} })).toBe("");
   });
 
-  it("pyCmd: MAGPIE_PYTHON > command -v python3，并支持自定义 envFile", () => {
+  it("pyCmd: MAGPIE_PYTHON > DOTAI_PYTHON > command -v python3，并支持自定义 envFile", () => {
     const envPath = join(tmp, "secrets.sh");
     writeFileSync(envPath, "export MY_FLAG=hello_from_custom_env\n");
     const fakePy = join(tmp, "fake-py");
@@ -82,7 +82,7 @@ describe("magpie-shared-lib/runtime — 通用运行时原语（零供应商/零
     expect(cmd).toContain(`"${envPath}"`);
     const r = spawnSync("bash", ["-c", cmd], {
       encoding: "utf8",
-      env: { ...process.env, MAGPIE_PYTHON: fakePy },
+      env: { ...process.env, MAGPIE_PYTHON: fakePy, DOTAI_PYTHON: "/nonexistent/dotai-py" },
     });
     expect(r.status).toBe(0);
     expect(r.stdout).toContain(`FLAG=hello_from_custom_env ARGS=${join(tmp, "scripts", "job.py")} --ok`);
@@ -124,5 +124,34 @@ describe("magpie-shared-lib/runtime — 通用运行时原语（零供应商/零
     // Unescaped regex `.` would wrongly match FOO_BAR when looking up FOO.BAR
     expect(readSecretFromEnv("FOO.BAR", { envFile, env: {} })).toBe("");
     expect(readSecretFromEnv("FOO_BAR", { envFile, env: {} })).toBe("real");
+  });
+});
+
+describe("shared loopback/CSRF/shutdown primitives", () => {
+  it("createCsrfToken / verifyCsrfToken / injectCsrfMeta / isLoopbackHost / bindHostShutdown", async () => {
+    const {
+      createCsrfToken,
+      verifyCsrfToken,
+      injectCsrfMeta,
+      isLoopbackHost,
+      bindHostShutdown,
+    } = await import("./runtime.mjs");
+    const tok = createCsrfToken();
+    expect(tok).toMatch(/^[0-9a-f]{48}$/);
+    expect(verifyCsrfToken(tok, tok)).toBe(true);
+    expect(verifyCsrfToken(tok.slice(0, -1) + (tok.endsWith("0") ? "1" : "0"), tok)).toBe(false);
+    expect(verifyCsrfToken("", tok)).toBe(false);
+
+    const html = injectCsrfMeta("<html><head><title>x</title></head><body></body></html>", tok);
+    expect(html).toContain(`<meta name="magpie-csrf" content="${tok}">`);
+
+    expect(isLoopbackHost("127.0.0.1:3485")).toBe(true);
+    expect(isLoopbackHost("localhost:3483")).toBe(true);
+    expect(isLoopbackHost("evil.example:3485")).toBe(false);
+
+    const beforeTerm = process.listenerCount("SIGTERM");
+    const unbind = bindHostShutdown(() => {}, { watchHostStdin: false });
+    expect(process.listenerCount("SIGTERM")).toBe(beforeTerm);
+    unbind();
   });
 });

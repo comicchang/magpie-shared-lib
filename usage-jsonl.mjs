@@ -5,7 +5,7 @@
  * Magpie's built-in `magpie.read("usage:summary")` bridge endpoint intentionally
  * returns only the global Top-20 models and strips the `provider` prefix from
  * each model row (returning bare `model` + `input`/`output`/`calls`/`cost`).
- * Domain-scoped extensions therefore cannot filter
+ * Domain-scoped plugins (Mify, A6API, Relay Stations) therefore cannot filter
  * accurately or see models ranked below #20 via `usage:summary` alone.
  *
  * This module reads `~/.config/magpie/usage.jsonl` backwards from EOF in 512KB
@@ -32,6 +32,9 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 export const EXCLUDED_RELAY_PROVIDERS = new Set([
+  "mify",
+  "mify-home",
+  "a6api",
   "codex",
   "openai-codex",
   "workbuddy",
@@ -68,6 +71,8 @@ export function defaultSettingsPath(env = process.env) {
 export function classifyDomain(provider) {
   const p = String(provider || "").trim().toLowerCase();
   if (!p) return null;
+  if (p === "mify" || p === "mify-home") return "mify";
+  if (p === "a6api") return "a6api";
   if (EXCLUDED_RELAY_PROVIDERS.has(p)) return null;
   return "relay";
 }
@@ -413,6 +418,10 @@ export function summarizeUsageJsonl({
             }
             consecutiveOlder = 0;
             if (fastTs < bounds.since30d || fastTs > bounds.nowMs + 3_600_000) return;
+            if (!customMatcher) {
+              if (targetDomain === "mify" && !trimmed.includes('"mify')) return;
+              if (targetDomain === "a6api" && !trimmed.includes('"a6api"')) return;
+            }
           }
         }
       }
@@ -496,6 +505,37 @@ function buildEmptyPayload(domain, nowMs, source) {
 }
 
 /**
+ * Render `window.__MAGPIE_DOMAIN_USAGE__ = ...;` in memory (zero disk writes).
+ * Used by local HTTP plugin servers (`/usage-data.js`) so plugin directories stay
+ * completely immutable and never trigger Magpie's local plugin file-watcher reloads.
+ */
+export function renderDomainUsageScript({
+  domain,
+  providers,
+  matcher,
+  excludedProviders,
+  usagePath = defaultUsagePath(),
+  settingsPath = defaultSettingsPath(),
+  now = new Date(),
+  useCache = true,
+} = {}) {
+  const payload = summarizeUsageJsonl({
+    domain,
+    providers,
+    matcher,
+    excludedProviders,
+    usagePath,
+    settingsPath,
+    now,
+    useCache,
+  });
+  const js =
+    `// Generated locally from Magpie usage.jsonl (domain: ${payload.domain}). Zero remote requests.\n` +
+    `window.__MAGPIE_DOMAIN_USAGE__ = ${JSON.stringify(payload)};\n`;
+  return { js, payload };
+}
+
+/**
  * Atomically write `window.__MAGPIE_DOMAIN_USAGE__ = ...;` for a Magpie plugin page.
  */
 export function writeDomainUsageSidecar({
@@ -510,7 +550,7 @@ export function writeDomainUsageSidecar({
   useCache = true,
 } = {}) {
   if (!outPath) throw new Error("writeDomainUsageSidecar requires outPath");
-  const payload = summarizeUsageJsonl({
+  const { js, payload } = renderDomainUsageScript({
     domain,
     providers,
     matcher,
@@ -521,11 +561,8 @@ export function writeDomainUsageSidecar({
     useCache,
   });
   mkdirSync(dirname(outPath), { recursive: true });
-  const js =
-    `// Generated locally from Magpie usage.jsonl (domain: ${payload.domain}). Zero remote requests.\n` +
-    `window.__MAGPIE_DOMAIN_USAGE__ = ${JSON.stringify(payload)};\n`;
   const tmpPath = `${outPath}.tmp.${process.pid}.${Date.now()}`;
-  writeFileSync(tmpPath, js, "utf8");
+  writeFileSync(tmpPath, js, { encoding: "utf8", mode: 0o600 });
   renameSync(tmpPath, outPath);
   return payload;
 }
@@ -548,7 +585,8 @@ export function startUsageSidecarPoller({
   if (
     !enabled ||
     !outPath ||
-    process.env.MAGPIE_USAGE_SIDECAR === "0"
+    process.env.MAGPIE_USAGE_SIDECAR === "0" ||
+    process.env.DOTAI_USAGE_SIDECAR === "0"
   ) {
     return {
       stop() {},
